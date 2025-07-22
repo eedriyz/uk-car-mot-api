@@ -1,8 +1,9 @@
 {
-  "name": "uk-car-mot-server",
+  "name": "uk-car-mot-api",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
+    "postinstall": "PUPPETEER_SKIP_DOWNLOAD=true",
     "start": "node server.js"
   },
   "dependencies": {
