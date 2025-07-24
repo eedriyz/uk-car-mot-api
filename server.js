@@ -1,7 +1,14 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer'); // Changed from puppeteer-core
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Add CORS headers
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    next();
+});
 
 app.use(express.json());
 
@@ -12,20 +19,32 @@ app.get('/api/mot/:reg', async (req, res) => {
     try {
         const browser = await puppeteer.launch({
             headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu'
+            ]
         });
 
         const page = await browser.newPage();
-        await page.goto(url, { waitUntil: 'networkidle2' });
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        const html = await page.content(); // Entire page HTML
-
+        const html = await page.content();
         await browser.close();
 
-        res.send(html); // Send HTML back to frontend
+        res.send(html);
     } catch (err) {
-        console.error(err);
-        res.status(500).send("Something went wrong trying to fetch MOT data.");
+        console.error('Puppeteer Error:', err);
+        res.status(500).json({ 
+            error: "Failed to fetch MOT data", 
+            details: err.message 
+        });
     }
 });
 
