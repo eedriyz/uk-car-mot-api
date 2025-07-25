@@ -1,126 +1,130 @@
 const express = require('express');
-const { chromium } = require('playwright');
+const cors = require('cors');
+
+// Load environment variables in development
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Add CORS headers
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    next();
-});
+// Enable CORS for all routes
+app.use(cors());
 
+// Parse JSON request bodies
 app.use(express.json());
 
-app.get('/api/mot/:reg', async (req, res) => {
-    const reg = req.params.reg.toUpperCase();
-    const url = `https://www.check-mot.service.gov.uk/results?registration=${reg}&checkRecalls=true`;
+// API key from environment variables (never stored in code)
+const DVSA_API_KEY = process.env.DVSA_API_KEY;
 
-    let browser;
-    try {
-        // Launch browser with stealth settings
-        browser = await chromium.launch({
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-features=VizDisplayCompositor',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding'
-            ]
-        });
-
-        const context = await browser.newContext({
-            // Mimic real browser
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport: { width: 1366, height: 768 },
-            locale: 'en-GB',
-            timezoneId: 'Europe/London',
-            // Enable JavaScript and images
-            javaScriptEnabled: true,
-            acceptDownloads: false
-        });
-
-        const page = await context.newPage();
-        
-        // Set additional headers to look more human
-        await page.setExtraHTTPHeaders({
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-GB,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Cache-Control': 'max-age=0'
-        });
-
-        console.log(`Fetching MOT data for: ${reg}`);
-        
-        // Navigate with realistic timing
-        await page.goto(url, { 
-            waitUntil: 'networkidle', 
-            timeout: 30000 
-        });
-
-        // Wait a bit to avoid looking too bot-like
-        await page.waitForTimeout(2000);
-
-        // Check if we got blocked
-        const content = await page.content();
-        
-        if (content.includes('Pardon Our Interruption') || 
-            content.includes('you were a bot') ||
-            content.includes('JavaScript are enabled')) {
-            throw new Error('Blocked by bot detection');
-        }
-
-        // Check if vehicle found
-        if (content.includes('No results found') || 
-            content.includes('Vehicle not found')) {
-            return res.status(404).json({ 
-                error: 'Vehicle not found',
-                registration: reg 
-            });
-        }
-
-        await browser.close();
-        
-        console.log(`Successfully fetched MOT data for: ${reg}`);
-        res.send(content);
-
-    } catch (err) {
-        console.error('API Error:', err.message);
-        
-        if (browser) {
-            await browser.close();
-        }
-        
-        res.status(500).json({ 
-            error: "Failed to fetch MOT data", 
-            details: err.message,
-            registration: reg
-        });
-    }
-});
-
+// Home route
 app.get('/', (req, res) => {
-    res.send('MOT API is running - Playwright version');
+  res.send('UK MOT API is running! Use /api/mot/:registration to get vehicle data.');
 });
 
-app.get('/test', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        timestamp: new Date().toISOString(),
-        service: 'MOT API with Playwright'
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    time: new Date().toISOString(),
+    apiConfigured: !!DVSA_API_KEY
+  });
+});
+
+// Main MOT data endpoint
+app.get('/api/mot/:registration', async (req, res) => {
+  const registration = req.params.registration.toUpperCase().replace(/\s/g, '');
+  
+  // Validate registration format
+  if (!registration.match(/^[A-Z0-9]{1,7}$/)) {
+    return res.status(400).json({
+      error: "Invalid registration format",
+      registration: registration
     });
+  }
+
+  // Check if API key is configured
+  if (!DVSA_API_KEY) {
+    return res.status(500).json({
+      error: "API not properly configured. API key missing.",
+      contact: "Please contact the administrator."
+    });
+  }
+
+  try {
+    console.log(`Fetching data for vehicle: ${registration}`);
+    
+    // Step 1: Get vehicle details
+    const vehicleResponse = await fetch(`https://beta.check-mot.service.gov.uk/trade/vehicles/${registration}`, {
+      headers: {
+        'x-api-key': DVSA_API_KEY,
+        'Accept': 'application/json+v6'
+      }
+    });
+
+    // Handle vehicle not found
+    if (vehicleResponse.status === 404) {
+      return res.status(404).json({
+        error: "Vehicle not found",
+        registration: registration
+      });
+    }
+    
+    // Handle other errors
+    if (!vehicleResponse.ok) {
+      throw new Error(`Vehicle API returned status: ${vehicleResponse.status}`);
+    }
+
+    const vehicleData = await vehicleResponse.json();
+    
+    if (!vehicleData || vehicleData.length === 0) {
+      return res.status(404).json({
+        error: "No data found for this vehicle",
+        registration: registration
+      });
+    }
+
+    // Step 2: Get MOT test history using vehicle ID
+    const vehicleId = vehicleData[0].vehicleId;
+    
+    const motResponse = await fetch(`https://beta.check-mot.service.gov.uk/trade/vehicles/${vehicleId}/mot-tests`, {
+      headers: {
+        'x-api-key': DVSA_API_KEY,
+        'Accept': 'application/json+v6'
+      }
+    });
+
+    // Handle MOT data errors
+    if (!motResponse.ok) {
+      throw new Error(`MOT API returned status: ${motResponse.status}`);
+    }
+
+    const motData = await motResponse.json();
+
+    // Combine vehicle and MOT data
+    const result = {
+      vehicle: vehicleData[0],
+      motTests: motData
+    };
+
+    console.log(`Successfully retrieved MOT data for: ${registration}`);
+    res.json(result);
+    
+  } catch (error) {
+    console.error(`Error fetching MOT data: ${error.message}`);
+    res.status(500).json({
+      error: "Failed to retrieve MOT data",
+      details: error.message,
+      registration: registration
+    });
+  }
 });
 
+// Start server
 app.listen(port, () => {
-    console.log(`MOT API Server running on port ${port}`);
+  console.log(`Server running on port ${port}`);
+  if (!DVSA_API_KEY) {
+    console.warn('⚠️  WARNING: DVSA_API_KEY environment variable not set!');
+  }
 });
