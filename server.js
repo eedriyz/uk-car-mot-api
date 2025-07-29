@@ -393,6 +393,65 @@ app.get('/test-auth', async (req, res) => {
   }
 });
 
+// Test MOT API with a known registration
+app.get('/test-mot-api/:registration', async (req, res) => {
+  const registration = req.params.registration.toUpperCase().replace(/\s/g, '');
+  
+  try {
+    console.log(`Testing MOT API with registration: ${registration}`);
+    
+    // Get access token (we know this works from test-auth)
+    const accessToken = await getAccessToken();
+    console.log('Access token obtained successfully');
+    
+    // Test API key directly
+    console.log('Testing with API key:', AUTH_CONFIG.apiKey?.substring(0, 5) + '...');
+    
+    const apiResponse = await axios({
+      method: 'get',
+      url: 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'x-api-key': AUTH_CONFIG.apiKey,
+        'Accept': 'application/json+v6',
+        'User-Agent': 'MOT-API-Client/1.0'
+      },
+      params: {
+        registration: registration
+      },
+      timeout: 15000
+    });
+    
+    // If we get here, it worked!
+    res.json({
+      success: true,
+      motApiWorking: true,
+      statusCode: apiResponse.status,
+      dataReceived: !!apiResponse.data,
+      registration: registration
+    });
+    
+  } catch (error) {
+    console.error('MOT API test error:', error.response?.data || error.message);
+    
+    // Detailed error response
+    res.status(500).json({
+      success: false,
+      error: 'MOT API test failed',
+      statusCode: error.response?.status,
+      errorDetails: error.response?.data || error.message,
+      request: {
+        url: 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests',
+        method: 'GET',
+        params: { registration },
+        hasToken: true,
+        hasApiKey: !!AUTH_CONFIG.apiKey,
+        accept: 'application/json+v6'
+      }
+    });
+  }
+});
+
 // Test access to token endpoint
 app.get('/test-token-url', async (req, res) => {
   try {
@@ -437,6 +496,7 @@ app.get('/', (req, res) => {
       mot: '/api/mot/:registration',
       health: '/health',
       testAuth: '/test-auth',
+      testMotApi: '/test-mot-api/:registration',
       testTokenUrl: '/test-token-url'
     }
   });
