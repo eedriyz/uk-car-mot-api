@@ -1,253 +1,133 @@
 const express = require('express');
-const axios = require('axios');
-const qs = require('querystring');
+const fetch = require('node-fetch');
+require('dotenv').config();
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
-// Load environment variables
-if (process.env.NODE_ENV !== 'production') {
-  require('dotenv').config();
-}
+// --- DVSA API Credentials from Environment Variables ---
+const { CLIENT_ID, CLIENT_SECRET, TENANT_ID, DVSA_API_KEY } = process.env;
+const TOKEN_URL = `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`;
+const API_BASE_URL = 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests';
+const SCOPE = 'https://tapi.dvsa.gov.uk/.default';
 
-// Enable CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  next();
-});
-app.use(express.json());
-
-// DVSA Configuration
-const AUTH_CONFIG = {
-  clientId: process.env.DVSA_CLIENT_ID,
-  clientSecret: process.env.DVSA_CLIENT_SECRET,
-  apiKey: process.env.DVSA_API_KEY,
-  tokenUrl: process.env.DVSA_TOKEN_URL,
-  scope: 'https://tapi.dvsa.gov.uk/.default'
-};
-
-// Token storage
+// --- In-memory cache for the OAuth token ---
 let tokenCache = {
-  accessToken: null,
-  expiresAt: null
+    accessToken: null,
+    expiresAt: null,
 };
 
-// Function to get OAuth access token (POST request)
-async function getAccessToken() {
-  const now = Date.now();
-  
-  // Check if we have a valid cached token
-  if (tokenCache.accessToken && tokenCache.expiresAt && now < tokenCache.expiresAt) {
-    console.log('Using cached access token');
-    return tokenCache.accessToken;
-  }
+// --- Function to get a valid OAuth token ---
+async function getDVSAToken() {
+    // If we have a valid, non-expired token, return it
+    if (tokenCache.accessToken && tokenCache.expiresAt > Date.now()) {
+        console.log('Using cached token.');
+        return tokenCache.accessToken;
+    }
 
-  try {
-    console.log('Requesting new access token via POST...');
-    
-    // POST request to get OAuth token
-    const tokenResponse = await axios({
-      method: 'POST', // OAuth token acquisition is POST
-      url: AUTH_CONFIG.tokenUrl,
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json'
-      },
-      data: qs.stringify({
-        grant_type: 'client_credentials',
-        client_id: AUTH_CONFIG.clientId,
-        client_secret: AUTH_CONFIG.clientSecret,
-        scope: AUTH_CONFIG.scope
-      }),
-      timeout: 10000
-    });
+    console.log('Fetching new DVSA token...');
+    try {
+        const params = new URLSearchParams();
+        params.append('grant_type', 'client_credentials');
+        params.append('client_id', CLIENT_ID);
+        params.append('client_secret', CLIENT_SECRET);
+        params.append('scope', SCOPE);
 
-    // Cache the new token
-    const expiresIn = tokenResponse.data.expires_in * 1000;
-    tokenCache = {
-      accessToken: tokenResponse.data.access_token,
-      expiresAt: now + expiresIn - 60000 // Subtract 1 minute for safety
-    };
+        const response = await fetch(TOKEN_URL, {
+            method: 'POST',
+            body: params,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        });
 
-    console.log('✅ New access token acquired');
-    return tokenCache.accessToken;
-    
-  } catch (error) {
-    console.error('❌ Error getting access token:', error.response?.data || error.message);
-    tokenCache = { accessToken: null, expiresAt: null };
-    throw new Error('Failed to authenticate with DVSA API');
-  }
+        if (!response.ok) {
+            const errorBody = await response.text();
+            throw new Error(`Token request failed with status ${response.status}: ${errorBody}`);
+        }
+
+        const data = await response.json();
+        
+        // Cache the new token and set its expiry time (e.g., 55 minutes)
+        tokenCache.accessToken = data.access_token;
+        tokenCache.expiresAt = Date.now() + (data.expires_in - 300) * 1000; // expires_in is in seconds, subtract 5 mins for buffer
+
+        console.log('Successfully fetched new token.');
+        return tokenCache.accessToken;
+    } catch (error) {
+        console.error('Error fetching DVSA token:', error);
+        tokenCache.accessToken = null; // Clear invalid token
+        throw error;
+    }
 }
 
-// GET endpoint for MOT data (this is what you should use)
-app.get('/api/mot/:registration', async (req, res) => {
-  const registration = req.params.registration.toUpperCase().replace(/\s/g, '');
-  
-  console.log(`🚗 MOT request for registration: ${registration}`);
-  
-  try {
-    // Step 1: Get OAuth access token (POST request)
-    const accessToken = await getAccessToken();
-    
-    // Step 2: Make GET request to MOT API
-    console.log('Making GET request to MOT API...');
-    const apiResponse = await axios({
-      method: 'GET', // MOT API uses GET requests
-      url: 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'x-api-key': AUTH_CONFIG.apiKey,
-        'Accept': 'application/json+v6'
-      },
-      params: {
-        registration: registration
-      },
-      timeout: 15000
-    });
-    
-    console.log(`✅ MOT API GET request successful for: ${registration}`);
-    
-    res.json({
-      success: true,
-      data: apiResponse.data,
-      registration: registration,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    console.error('❌ MOT API Error:', error.response?.data || error.message);
-    
-    if (error.response) {
-      const status = error.response.status;
-      
-      if (status === 404) {
-        return res.status(404).json({
-          error: "Vehicle not found",
-          registration: registration
+// --- API Endpoint for the Frontend to Call ---
+app.get('/api/mot-check/:registration', async (req, res) => {
+    const { registration } = req.params;
+    if (!registration) {
+        return res.status(400).json({ error: 'Registration number is required' });
+    }
+
+    try {
+        const accessToken = await getDVSAToken();
+        const apiUrl = `${API_BASE_URL}?registration=${registration}`;
+
+        const apiResponse = await fetch(apiUrl, {
+            headers: {
+                'Accept': 'application/json+v6',
+                'x-api-key': DVSA_API_KEY,
+                'Authorization': `Bearer ${accessToken}`,
+            },
         });
-      }
-      
-      if (status === 401 || status === 403) {
-        // Clear token cache on auth errors
-        tokenCache = { accessToken: null, expiresAt: null };
-        return res.status(500).json({
-          error: "API access denied",
-          message: "Authentication failed or API key not authorized",
-          registration: registration
-        });
-      }
+
+        if (!apiResponse.ok) {
+             if (apiResponse.status === 404) {
+                return res.status(404).json({ error: 'Vehicle not found.' });
+            }
+            const errorBody = await apiResponse.text();
+            throw new Error(`DVSA API request failed with status ${apiResponse.status}: ${errorBody}`);
+        }
+
+        const dvsaData = await apiResponse.json();
+        // The API returns an array, we take the first element
+        const vehicleInfo = dvsaData[0];
+
+        // --- Transform DVSA data into the structure the frontend expects ---
+        const transformedData = {
+            vehicle: {
+                registration: vehicleInfo.registration,
+                make: vehicleInfo.make,
+                model: vehicleInfo.model,
+                year: parseInt(vehicleInfo.firstUsedDate.substring(0, 4)),
+                colour: vehicleInfo.primaryColour,
+                fuel_type: vehicleInfo.fuelType,
+                engine_size: vehicleInfo.engineCapacity,
+                // Find the latest MOT test with an expiry date
+                mot_expiry: vehicleInfo.motTests?.find(t => t.expiryDate)?.expiryDate || null,
+                tax_expiry: null, // DVSA Trade API does not provide tax data
+                mot_status: vehicleInfo.motTests?.[0]?.testResult === 'PASSED' ? 'valid' : 'expired',
+            },
+            motTests: (vehicleInfo.motTests || []).map(test => ({
+                test_date: test.completedDate,
+                test_result: test.testResult,
+                mileage: parseInt(test.odometerValue),
+                expiry_date: test.expiryDate,
+                test_station: test.motTestNumber, // No station name in this API version
+                defects: (test.rfrAndComments || []).map(defect => ({
+                    type: defect.type, // e.g., 'ADVISORY', 'FAIL'
+                    description: defect.text,
+                    location: null, // No location data in this API version
+                })),
+            })),
+        };
+
+        res.json(transformedData);
+
+    } catch (error) {
+        console.error(`Error processing registration ${registration}:`, error.message);
+        res.status(500).json({ error: 'Failed to retrieve vehicle data from DVSA.' });
     }
-    
-    res.status(500).json({
-      error: "Failed to fetch MOT data",
-      message: error.message,
-      registration: registration
-    });
-  }
 });
 
-// Test endpoint - this should work now
-app.get('/test/:registration', async (req, res) => {
-  const registration = req.params.registration.toUpperCase().replace(/\s/g, '');
-  
-  try {
-    console.log(`🧪 Testing with registration: ${registration}`);
-    
-    // Get access token
-    const accessToken = await getAccessToken();
-    console.log('✅ Access token obtained');
-    
-    // Test the MOT API with GET request
-    const apiResponse = await axios({
-      method: 'GET',
-      url: 'https://beta.check-mot.service.gov.uk/trade/vehicles/mot-tests',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'x-api-key': AUTH_CONFIG.apiKey,
-        'Accept': 'application/json+v6'
-      },
-      params: {
-        registration: registration
-      },
-      timeout: 15000
-    });
-    
-    res.json({
-      success: true,
-      message: "GET request to MOT API successful",
-      registration: registration,
-      statusCode: apiResponse.status,
-      dataReceived: !!apiResponse.data,
-      vehicleCount: Array.isArray(apiResponse.data) ? apiResponse.data.length : 1
-    });
-    
-  } catch (error) {
-    console.error('❌ Test failed:', error.response?.data || error.message);
-    
-    res.json({
-      success: false,
-      message: "GET request to MOT API failed",
-      registration: registration,
-      error: {
-        status: error.response?.status,
-        message: error.message,
-        details: error.response?.data
-      }
-    });
-  }
-});
-
-// Health check
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    timestamp: new Date().toISOString(),
-    credentials: {
-      clientId: !!AUTH_CONFIG.clientId,
-      clientSecret: !!AUTH_CONFIG.clientSecret,
-      apiKey: !!AUTH_CONFIG.apiKey,
-      tokenUrl: !!AUTH_CONFIG.tokenUrl
-    },
-    tokenCache: {
-      hasToken: !!tokenCache.accessToken,
-      expiresAt: tokenCache.expiresAt ? new Date(tokenCache.expiresAt).toISOString() : null
-    }
-  });
-});
-
-// Home route
-app.get('/', (req, res) => {
-  res.json({
-    service: 'DVSA MOT API - Correct Implementation',
-    version: '2.0.0',
-    status: 'running',
-    endpoints: {
-      mot: '/api/mot/:registration (GET)',
-      test: '/test/:registration (GET)',
-      health: '/health (GET)'
-    },
-    implementation: {
-      tokenRequest: 'POST to OAuth endpoint',
-      motApiRequest: 'GET to MOT API endpoint'
-    }
-  });
-});
-
-// Start server
-app.listen(port, () => {
-  console.log(`🚀 DVSA MOT API Server running on port ${port}`);
-  console.log(`📋 Implementation: OAuth=POST, MOT API=GET`);
-  
-  const missingConfig = [];
-  if (!AUTH_CONFIG.clientId) missingConfig.push('DVSA_CLIENT_ID');
-  if (!AUTH_CONFIG.clientSecret) missingConfig.push('DVSA_CLIENT_SECRET');
-  if (!AUTH_CONFIG.apiKey) missingConfig.push('DVSA_API_KEY');
-  if (!AUTH_CONFIG.tokenUrl) missingConfig.push('DVSA_TOKEN_URL');
-  
-  if (missingConfig.length > 0) {
-    console.warn('⚠️  WARNING: Missing environment variables:', missingConfig.join(', '));
-  } else {
-    console.log('✅ All DVSA API credentials configured');
-  }
+// --- Server Startup ---
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
 });
